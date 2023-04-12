@@ -9,58 +9,58 @@ from torchvision import transforms
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchvision.transforms import ToPILImage
+import glob
 
+def compute_mean_std(folder_path):
+    image_files = glob.glob(os.path.join(folder_path, '*.png'))
 
-def compute_mean_std(folder):
-    num_pixels = 0
-    sum_pixel_values = 0
-    sum_squared_pixel_values = 0
+    mean_list = []
+    std_list = []
 
-    image_files = os.listdir(folder)
-    for image_file in image_files:
-        img_path = os.path.join(folder, image_file)
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        img = cv2.resize(img, (224, 224))
+    for img_path in image_files:
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        img = cv2.resize(img, (224, 224)).astype(np.float32)
+        img /= 255.0
+        means = [np.mean(img[:, :, i]) for i in range(3)]
+        stds = [np.std(img[:, :, i]) for i in range(3)]
+        mean_list.append(means)
+        std_list.append(stds)
 
-        num_pixels += img.size
-        sum_pixel_values += img.sum()
-        sum_squared_pixel_values += np.sum(np.square(img))
-
-    mean = sum_pixel_values / num_pixels
-    var = sum_squared_pixel_values / num_pixels - mean**2
-    var = np.clip(var, 0, None)  # Ensure the variance is non-negative
-    std = np.sqrt(var)
+    mean_list = np.array(mean_list)
+    std_list = np.array(std_list)
+    mean = np.mean(mean_list, axis=0)
+    std = np.mean(std_list, axis=0)
 
     return mean, std
 
 
 # Custom dataset class
 class ImageDataset(Dataset):
-    # Add mean and std parameters for normalization
-    def __init__(self, folder, transform=None, mean=0.0, std=1.0):
+    def __init__(self, folder, transform=None, mean=None, std=None):
         self.folder = folder
+        self.image_files = sorted(glob.glob(os.path.join(folder, '*.png')))
         self.transform = transform
         self.mean = mean
         self.std = std
-        self.image_files = os.listdir(folder)
 
     def __len__(self):
         return len(self.image_files)
-    
+
     def __getitem__(self, index):
-        img_path = os.path.join(self.folder, self.image_files[index])
-        
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        img_path = self.image_files[index]
+
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         img = cv2.resize(img, (224, 224))
 
-        img = img / 255.0  # Normalize to the range of [0, 1]
         img = img.astype(np.float32)
+        img /= 255.0  # Normalize to the range of [0, 1]
+        img = (img * 255).astype(np.uint8)  # Convert the image back to uint8 before applying the transform
 
         if self.transform:
             img = self.transform(img)  # Apply the transform
         else:
-            img = torch.tensor(img).unsqueeze(0)  # Convert the numpy array to a tensor
-            
+            img = torch.tensor(img).permute(2, 0, 1)  # Convert the numpy array to a tensor
+
         return img
 
 
@@ -69,7 +69,7 @@ class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 16, 3, stride=2, padding=1),
+            nn.Conv2d(3, 16, 3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1),
             nn.ReLU(),
@@ -87,7 +87,7 @@ class VAE(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(16, 1, 4, stride=2, padding=1),
+            nn.ConvTranspose2d(16, 3, 4, stride=2, padding=1),
             nn.Sigmoid(),
         )
 
@@ -143,7 +143,7 @@ def validate(model, dataloader, device):
 # Main function
 def main():
     # Parameters
-    epochs = 50
+    epochs = 100
     batch_size = 16
     learning_rate = 1e-3
     train_folder = 'transistor/train/good'
@@ -182,6 +182,7 @@ def main():
 
 
     inference_dataset = ImageDataset(train_folder, transform=inference_transform, mean=mean, std=std)
+    inference_dataloader = DataLoader(inference_dataset, batch_size=1, shuffle=False)
 
     # Initialize model, loss, and optimizer
     model = VAE().to(device)
@@ -209,34 +210,33 @@ def main():
 
     # Inference on a test image
     test_image_path = 'transistor/test/damaged_case/009.png'
-    test_image = cv2.imread(test_image_path, cv2.IMREAD_GRAYSCALE)
+    test_image = cv2.imread(test_image_path, cv2.IMREAD_COLOR)
     test_image = cv2.resize(test_image, (224, 224))
 
-    test_image = (test_image - mean) / (std + 1e-7)
-    test_image = test_image.astype(np.float32)
+    mean, std = compute_mean_std(train_folder)
 
-    # Create a new transform for the test image
     test_transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.ToTensor(),
-        transforms.Normalize((mean,), (std + 1e-7,)),  # Add normalization to the test_transform
+        transforms.Normalize(mean, std),
     ])
-
 
     test_image_tensor = test_transform(test_image).unsqueeze(0).to(device)
 
     diffs = []
-    for img in inference_dataset:
-        img_np = np.array(img)
-        img_tensor = torch.from_numpy(img_np).unsqueeze(0).to(device)
+    for img_batch in inference_dataloader:
+        img_np = img_batch.squeeze().numpy()
+        img_tensor = img_batch.to(device)
 
         with torch.no_grad():
             reconstructed_img, _, _ = model(img_tensor)
-            reconstructed_img_np = reconstructed_img.squeeze().cpu().numpy()  # Fix the variable name
-            diff = np.abs(img.cpu().numpy() - reconstructed_img_np)
+            reconstructed_img_np = reconstructed_img.squeeze().cpu().numpy()
+            diff = np.abs(img_np - reconstructed_img_np)
             diffs.append(diff)
 
     diffs = np.array(diffs)
+
+
     mean_diff = np.mean(diffs)
     std_diff = np.std(diffs)
 
@@ -253,12 +253,15 @@ def main():
         reconstructed_test_image = reconstructed_test_image.squeeze().cpu().numpy()
 
 
-    test_image_normalized = test_image_tensor.squeeze().cpu().numpy()
+    test_image_normalized = test_image_tensor.squeeze().cpu().numpy().transpose(1, 2, 0)
+    reconstructed_test_image = reconstructed_test_image.transpose(1, 2, 0)  # Change the shape from (3, 224, 224) to (224, 224, 3)
     anomaly_map = np.abs(test_image_normalized - reconstructed_test_image)
+
+    anomaly_map = np.mean(anomaly_map, axis=-1)  # Calculate mean along the channel axis
     anomaly_map = (anomaly_map > threshold).astype(np.uint8)
 
     # Draw contours on the original image
-    test_image_rgb = cv2.cvtColor(test_image, cv2.COLOR_GRAY2RGB)
+    test_image_rgb = test_image
     contours, _ = cv2.findContours(anomaly_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(test_image_rgb, contours, -1, (0, 255, 0), 2)
 
